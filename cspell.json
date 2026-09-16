@@ -387,6 +387,7 @@
     "secp",
     "sels",
     "semistrict",
+    "serde",
     "serp",
     "serverjs",
     "SETLOCAL",

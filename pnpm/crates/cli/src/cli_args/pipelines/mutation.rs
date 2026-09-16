@@ -1,8 +1,8 @@
 use super::{
-    AddArgs, Arc, BTreeMap, Config, Context, DedicatedProjectRuns, DeployArgs, InstallFamilyPlan,
-    Path, PathBuf, RemoveArgs, Reporter, State, UpdateArgs, UpdateChangesetContext,
-    anchor_active_project, config_deps, dedicated_project_name, ecosystem_add, ecosystem_install,
-    init_shared_state, select_install_family_plan,
+    AddArgs, Arc, BTreeMap, Config, Context, DedicatedProjectRuns, DeployArgs,
+    EcosystemPackageSpecifier, InstallFamilyPlan, Path, PathBuf, RemoveArgs, Reporter, State,
+    UpdateArgs, UpdateChangesetContext, anchor_active_project, config_deps, dedicated_project_name,
+    ecosystem_add, ecosystem_install, init_shared_state, select_install_family_plan,
 };
 
 pub(crate) struct AddPipeline {
@@ -16,19 +16,21 @@ pub(crate) struct AddPipeline {
     /// before this pipeline scaffolds a manifest. `Some` exactly when
     /// `--config` was passed.
     pub(crate) config_dependencies: Option<BTreeMap<String, String>>,
-    pub(crate) package_specifier_plan: crate::package_specifier::PackageSpecifierPlan,
+    /// The selectors routed away from the npm add path, which receives
+    /// the rest through [`AddArgs::package_names`].
+    pub(crate) ecosystem_packages: Vec<EcosystemPackageSpecifier>,
 }
 
 impl AddPipeline {
     pub(crate) async fn run<Reporter: self::Reporter + 'static>(self) -> miette::Result<()> {
         config_deps::prepare::<Reporter>(self.cfg, &self.config_root, false).await?;
-        if !self.package_specifier_plan.ecosystem_packages.is_empty() {
+        if !self.ecosystem_packages.is_empty() {
             return run_add_with_ecosystems::<Reporter>(
                 self.args,
                 self.cfg,
                 self.prefix,
                 self.manifest_path,
-                self.package_specifier_plan,
+                self.ecosystem_packages,
             )
             .await;
         }
@@ -112,9 +114,9 @@ async fn run_add_with_ecosystems<Reporter: self::Reporter + 'static>(
     cfg: &'static mut Config,
     prefix: PathBuf,
     manifest_path: PathBuf,
-    package_specifier_plan: crate::package_specifier::PackageSpecifierPlan,
+    ecosystem_packages: Vec<EcosystemPackageSpecifier>,
 ) -> miette::Result<()> {
-    let has_node_packages = !package_specifier_plan.node_packages.is_empty();
+    let has_node_packages = !args.package_names.is_empty();
     if !cfg.shares_one_lockfile() && cfg.workspace_dir.is_some() && has_node_packages {
         let manifest_dir = manifest_path
             .parent()
@@ -133,7 +135,7 @@ async fn run_add_with_ecosystems<Reporter: self::Reporter + 'static>(
             frozen_lockfile: false,
         },
         prefix,
-        package_specifier_plan.ecosystem_packages,
+        ecosystem_packages,
         &args,
         has_node_packages,
     )
@@ -142,11 +144,9 @@ async fn run_add_with_ecosystems<Reporter: self::Reporter + 'static>(
         return plan.run().await;
     }
     let metadata = node_add_metadata_paths(cfg, &manifest_path);
-    let mut node_args = args;
-    node_args.package_names = package_specifier_plan.node_packages;
     let node_install = async move {
         let state = init_shared_state(manifest_path, cfg, false, None, http_client)?;
-        Box::pin(node_args.run::<Reporter>(state, None)).await
+        Box::pin(args.run::<Reporter>(state, None)).await
     };
     plan.with_task(pnpm_install_coordinator::InstallTask::in_place(metadata, node_install))
         .run()
