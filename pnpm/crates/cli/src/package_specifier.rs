@@ -29,7 +29,10 @@ pub(crate) struct PackageSpecifierPlan {
 }
 
 impl PackageSpecifierPlan {
-    pub(crate) fn parse(package_names: &[String]) -> Result<Self> {
+    pub(crate) fn parse<Text>(package_names: impl IntoIterator<Item = Text>) -> Result<Self>
+    where
+        Text: AsRef<str> + Into<String>,
+    {
         let mut node_packages = Vec::new();
         let mut ecosystem_packages = Vec::new();
         for package_name in package_names {
@@ -60,17 +63,24 @@ enum ParsedSpecifier {
     Ecosystem(EcosystemPackageSpecifier),
 }
 
-fn parse_specifier(specifier: &str) -> Result<ParsedSpecifier> {
-    if let Some(rest) = specifier.strip_prefix(CARGO_PROTOCOL) {
-        return parse_registry_specifier(rest, specifier).map(cargo_specifier);
+/// An npm selector is the one kind kept verbatim, so it is the only one that
+/// gains from owning the text. Every other arm reads the selector and builds
+/// something else out of it, which is why the bound asks for both.
+fn parse_specifier<Text>(specifier: Text) -> Result<ParsedSpecifier>
+where
+    Text: AsRef<str> + Into<String>,
+{
+    let text = specifier.as_ref();
+    if let Some(rest) = text.strip_prefix(CARGO_PROTOCOL) {
+        return parse_registry_specifier(rest, text).map(cargo_specifier);
     }
-    if let Some(rest) = specifier.strip_prefix(PYTHON_PROTOCOL) {
-        return parse_python_specifier(rest, specifier).map(python_specifier);
+    if let Some(rest) = text.strip_prefix(PYTHON_PROTOCOL) {
+        return parse_python_specifier(rest, text).map(python_specifier);
     }
-    let Some(body) = purl::strip_scheme(specifier) else {
-        return Ok(ParsedSpecifier::Node(specifier.to_string()));
+    let Some(body) = purl::strip_scheme(text) else {
+        return Ok(ParsedSpecifier::Node(specifier.into()));
     };
-    parse_purl(&Purl::parse(body, specifier)?, specifier)
+    parse_purl(&Purl::parse(body, text)?, text)
 }
 
 /// Routes a Package URL to the ecosystem its type names, spelling it the way
