@@ -29,7 +29,7 @@ pub(crate) struct PackageSpecifierPlan {
 }
 
 impl PackageSpecifierPlan {
-    pub(crate) fn parse(package_names: &[String]) -> Result<Self> {
+    pub(crate) fn parse(package_names: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut node_packages = Vec::new();
         let mut ecosystem_packages = Vec::new();
         for package_name in package_names {
@@ -60,17 +60,19 @@ enum ParsedSpecifier {
     Ecosystem(EcosystemPackageSpecifier),
 }
 
-fn parse_specifier(specifier: &str) -> Result<ParsedSpecifier> {
+/// Takes the selector by value so an npm one, which is kept verbatim, moves
+/// into the plan instead of being cloned.
+fn parse_specifier(specifier: String) -> Result<ParsedSpecifier> {
     if let Some(rest) = specifier.strip_prefix(CARGO_PROTOCOL) {
-        return parse_registry_specifier(rest, specifier).map(cargo_specifier);
+        return parse_registry_specifier(rest, &specifier).map(cargo_specifier);
     }
     if let Some(rest) = specifier.strip_prefix(PYTHON_PROTOCOL) {
-        return parse_python_specifier(rest, specifier).map(python_specifier);
+        return parse_python_specifier(rest, &specifier).map(python_specifier);
     }
-    let Some(body) = purl::strip_scheme(specifier) else {
-        return Ok(ParsedSpecifier::Node(specifier.to_string()));
+    let Some(body) = purl::strip_scheme(&specifier) else {
+        return Ok(ParsedSpecifier::Node(specifier));
     };
-    parse_purl(&Purl::parse(body, specifier)?, specifier)
+    parse_purl(&Purl::parse(body, &specifier)?, &specifier)
 }
 
 /// Routes a Package URL to the ecosystem its type names, spelling it the way
