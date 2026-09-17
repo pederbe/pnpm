@@ -64,10 +64,10 @@ enum ParsedSpecifier {
 /// into the plan instead of being cloned.
 fn parse_specifier(specifier: String) -> Result<ParsedSpecifier> {
     if let Some(rest) = specifier.strip_prefix(CARGO_PROTOCOL) {
-        return parse_registry_specifier(rest.to_string(), &specifier).map(cargo_specifier);
+        return parse_registry_specifier(rest, &specifier).map(cargo_specifier);
     }
     if let Some(rest) = specifier.strip_prefix(PYTHON_PROTOCOL) {
-        return parse_python_specifier(rest.to_string(), &specifier).map(python_specifier);
+        return parse_python_specifier(rest, &specifier).map(python_specifier);
     }
     let Some(body) = purl::strip_scheme(&specifier) else {
         return Ok(ParsedSpecifier::Node(specifier));
@@ -134,7 +134,7 @@ fn purl_registry_specifier(purl: &Purl, source: &str) -> Result<RegistryPackageS
         Some(version) => format!("{}@{version}", purl.name),
         None => purl.name.clone(),
     };
-    parse_registry_specifier(specifier, source)
+    parse_registry_specifier(&specifier, source)
 }
 
 /// A Package URL version is an exact version rather than a range, so it
@@ -187,32 +187,25 @@ fn python_specifier(requirement: String) -> ParsedSpecifier {
 /// A `pypi:` specifier as a PEP 508 requirement. pnpm spells a pinned
 /// version `name@version`, which becomes an exact pin unless the version
 /// already carries its own comparison operator.
-fn parse_python_specifier(mut specifier: String, source: &str) -> Result<String> {
-    let Some(at) = specifier.rfind('@') else {
-        return python_requirement(&specifier);
+fn parse_python_specifier(specifier: &str, source: &str) -> Result<String> {
+    let Some((name, version)) = specifier.rsplit_once('@') else {
+        return python_requirement(specifier);
     };
-    let version = &specifier[at + 1..];
     if version.is_empty() {
         return Err(miette::miette!("missing version after `@` in {source}"));
     }
     let operator = if version.starts_with(['<', '>', '=', '!', '~']) { "" } else { "==" };
-    specifier.replace_range(at..=at, operator);
-    python_requirement(&specifier)
+    python_requirement(&format!("{name}{operator}{version}"))
 }
 
 fn python_requirement(requirement: &str) -> Result<String> {
     Ok(pnpm_python_resolver::parse_requirement(requirement)?.to_string())
 }
 
-fn parse_registry_specifier(
-    mut specifier: String,
-    source: &str,
-) -> Result<RegistryPackageSpecifier> {
-    let (name_len, version_spec) = match specifier.rsplit_once('@') {
-        Some((name, version)) => (name.len(), Some(version.to_string())),
-        None => (specifier.len(), None),
-    };
-    let name = &specifier[..name_len];
+fn parse_registry_specifier(specifier: &str, source: &str) -> Result<RegistryPackageSpecifier> {
+    let (name, version_spec) = specifier
+        .rsplit_once('@')
+        .map_or((specifier, None), |(name, version)| (name, Some(version)));
     if name.is_empty()
         || !name
             .bytes()
@@ -220,10 +213,10 @@ fn parse_registry_specifier(
     {
         return Err(miette::miette!("invalid Cargo package name in {source}"));
     }
-    if version_spec.as_deref() == Some("") {
+    if version_spec == Some("") {
         return Err(miette::miette!("missing version after `@` in {source}"));
     }
-    if let Some(version) = version_spec.as_deref() {
+    if let Some(version) = version_spec {
         if version.contains(':') {
             return Err(miette::miette!(
                 "{source} is not supported by the crates.io-only proof of concept"
@@ -232,8 +225,10 @@ fn parse_registry_specifier(
         semver::VersionReq::parse(version)
             .map_err(|_| miette::miette!("invalid Cargo version requirement in {source}"))?;
     }
-    specifier.truncate(name_len);
-    Ok(RegistryPackageSpecifier { name: specifier, version_spec })
+    Ok(RegistryPackageSpecifier {
+        name: name.to_string(),
+        version_spec: version_spec.map(str::to_string),
+    })
 }
 
 #[cfg(test)]
