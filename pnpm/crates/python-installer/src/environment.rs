@@ -202,65 +202,154 @@ pub(super) async fn resolve_via_pnpr(
     }
 }
 
-pub(super) fn ensure_environment_parent(root: &Path) -> Result<()> {
-    let mut path = root.to_path_buf();
-    for component in [".pnpm", "python-envs"] {
-        path.push(component);
-        match fs::create_dir(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error).into_diagnostic(),
-        }
-        if !fs::symlink_metadata(&path).into_diagnostic()?.is_dir()
-            || pnpm_fs::is_symlink_or_junction(&path).into_diagnostic()?
-        {
-            bail!("managed Python directory must be a real directory: {}", path.display());
-        }
-    }
-    Ok(())
+/// The environments pnpm manages, kept in the store rather than beside
+/// their projects: one directory per project, holding one directory per
+/// generation, with the project's `.venv` linking to the generation it
+/// currently runs.
+///
+/// A repository with many Python projects therefore holds one link per
+/// project rather than a generation directory each, and an environment is
+/// on the store's filesystem, where the wheel files it shares with the
+/// store can be cloned or hardlinked.
+#[derive(Clone)]
+pub(super) struct EnvironmentStore {
+    root: PathBuf,
 }
 
-pub(super) fn validate_environment_link(root: &Path) -> Result<Option<PathBuf>> {
-    let link = root.join(".venv");
-    match fs::symlink_metadata(&link) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).into_diagnostic(),
-        Ok(_) => {
-            if !pnpm_fs::is_symlink_or_junction(&link).into_diagnostic()? {
-                bail!("pnpm will not replace an unmanaged Python environment: {}", link.display());
-            }
-            let target = root.join(pnpm_fs::read_symlink_dir(&link).into_diagnostic()?);
-            let target = dunce::canonicalize(&target)
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!(
-                        "resolve Python environment target {} for {}",
-                        target.display(),
+impl EnvironmentStore {
+    pub(super) fn new(store: &pnpm_store_dir::StoreDir) -> Self {
+        Self { root: store.root().join("python-envs") }
+    }
+
+    /// A fresh generation for the project at `root`, which publication
+    /// makes the project's own once every participant has prepared.
+    pub(super) fn new_generation(&self, root: &Path) -> Result<Generation> {
+        self.validate_link(root)?;
+        let directory = self.project_directory(root)?;
+        fs::create_dir_all(&directory)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("create Python environment directory {}", directory.display())
+            })?;
+        // `.venv` links to the generation by this path, so it is made
+        // absolute and physical here rather than at every reader.
+        let directory = dunce::canonicalize(&directory)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("resolve Python environment directory {}", directory.display())
+            })?;
+        let directory = tempfile::Builder::new()
+            .prefix("env-")
+            .tempdir_in(directory)
+            .into_diagnostic()?;
+        Ok(Generation { directory, store: self.clone() })
+    }
+
+    /// The directory holding the generations of the project at `root`,
+    /// named by the project's location so that two projects never share
+    /// one.
+    fn project_directory(&self, root: &Path) -> Result<PathBuf> {
+        let root = dunce::canonicalize(root)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("resolve Python project directory {}", root.display()))?;
+        Ok(self.root.join(pnpm_crypto_hash::create_short_hash(&root.to_string_lossy())))
+    }
+
+    /// The generation the project's `.venv` currently links to, or `None`
+    /// when it has no environment, or links to one that no longer exists.
+    ///
+    /// pnpm replaces only a link it made, so a `.venv` that is a directory,
+    /// or a link to anything but a generation of pnpm's, is refused. A link
+    /// into this store from another project's directory is still pnpm's: a
+    /// project that has moved keeps its environment.
+    pub(super) fn validate_link(&self, root: &Path) -> Result<Option<PathBuf>> {
+        let link = root.join(".venv");
+        match fs::symlink_metadata(&link) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).into_diagnostic(),
+            Ok(_) => {
+                if !pnpm_fs::is_symlink_or_junction(&link).into_diagnostic()? {
+                    bail!(
+                        "pnpm will not replace an unmanaged Python environment: {}",
                         link.display(),
-                    )
-                })?;
-            let managed = root.join(".pnpm/python-envs");
-            let managed = dunce::canonicalize(&managed)
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!(
-                        "resolve managed Python directory {} for {}",
-                        managed.display(),
+                    );
+                }
+                let Some(target) = link_target(root, &link)? else {
+                    return Ok(None);
+                };
+                if !self.holds(&target)? && !holds_beside_project(root, &target)? {
+                    bail!(
+                        "pnpm will not replace an unmanaged Python environment: {}",
                         link.display(),
-                    )
-                })?;
-            if target.parent() != Some(managed.as_path()) {
-                bail!("pnpm will not replace an unmanaged Python environment: {}", link.display());
+                    );
+                }
+                Ok(Some(target))
             }
-            Ok(Some(target))
         }
     }
+
+    /// Whether `generation` is a generation directory of a project
+    /// directory of this store.
+    fn holds(&self, generation: &Path) -> Result<bool> {
+        let root = match dunce::canonicalize(&self.root) {
+            Ok(root) => root,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error)
+                    .into_diagnostic()
+                    .wrap_err_with(|| {
+                        format!("resolve Python environment store {}", self.root.display())
+                    });
+            }
+        };
+        Ok(generation.parent().and_then(Path::parent) == Some(root.as_path()))
+    }
+}
+
+/// Where `link` leads, or `None` when it leads nowhere: a link to nothing
+/// protects nothing, and the store a link led into may have been removed
+/// since the environment was published.
+fn link_target(root: &Path, link: &Path) -> Result<Option<PathBuf>> {
+    let target = root.join(pnpm_fs::read_symlink_dir(link).into_diagnostic()?);
+    match dunce::canonicalize(&target) {
+        Ok(target) => Ok(Some(target)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "resolve Python environment target {} for {}",
+                    target.display(),
+                    link.display(),
+                )
+            }),
+    }
+}
+
+/// Whether `generation` is in the directory releases before pnpm 12.5 kept
+/// a project's generations in, beside the project. An environment they
+/// published is pnpm's to replace as much as one in the store.
+fn holds_beside_project(root: &Path, generation: &Path) -> Result<bool> {
+    match dunce::canonicalize(root.join(".pnpm/python-envs")) {
+        Ok(beside) => Ok(generation.parent() == Some(beside.as_path())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).into_diagnostic(),
+    }
+}
+
+/// A generation prepared in the store, removed with it unless publication
+/// keeps it. Publication asks the store it came from whether the project's
+/// `.venv` is a link pnpm may replace.
+pub(super) struct Generation {
+    pub(super) directory: tempfile::TempDir,
+    pub(super) store: EnvironmentStore,
 }
 
 pub(super) fn publish_link(root: &Path, target: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        let outcome = pnpm_fs::force_symlink_dir(target, &root.join(".venv")).into_diagnostic()?;
+        let outcome =
+            pnpm_fs::force_absolute_symlink_dir(target, &root.join(".venv")).into_diagnostic()?;
         if let Some(warning) = outcome.warning {
             bail!("{warning}");
         }
