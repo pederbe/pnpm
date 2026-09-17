@@ -29,9 +29,10 @@ pub(crate) struct PackageSpecifierPlan {
 }
 
 impl PackageSpecifierPlan {
-    pub(crate) fn parse<Text>(package_names: impl IntoIterator<Item = Text>) -> Result<Self>
+    pub(crate) fn parse<PackageNames>(package_names: PackageNames) -> Result<Self>
     where
-        Text: AsRef<str> + Into<String>,
+        PackageNames: IntoIterator,
+        PackageNames::Item: AsRef<str> + Into<String>,
     {
         let mut node_packages = Vec::new();
         let mut ecosystem_packages = Vec::new();
@@ -63,9 +64,9 @@ enum ParsedSpecifier {
     Ecosystem(EcosystemPackageSpecifier),
 }
 
-fn parse_specifier<Text>(specifier: Text) -> Result<ParsedSpecifier>
+fn parse_specifier<Specifier>(specifier: Specifier) -> Result<ParsedSpecifier>
 where
-    Text: AsRef<str> + Into<String>,
+    Specifier: AsRef<str> + Into<String>,
 {
     let text = specifier.as_ref();
     if let Some(rest) = text.strip_prefix(CARGO_PROTOCOL) {
