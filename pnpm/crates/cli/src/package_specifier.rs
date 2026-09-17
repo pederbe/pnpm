@@ -63,9 +63,6 @@ enum ParsedSpecifier {
     Ecosystem(EcosystemPackageSpecifier),
 }
 
-/// An npm selector is the one kind kept verbatim, so it is the only one that
-/// gains from owning the text. Every other arm reads the selector and builds
-/// something else out of it, which is why the bound asks for both.
 fn parse_specifier<Text>(specifier: Text) -> Result<ParsedSpecifier>
 where
     Text: AsRef<str> + Into<String>,
